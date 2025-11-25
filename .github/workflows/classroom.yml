@@ -1,0 +1,60 @@
+name: Autograding Tests
+'on':
+- push
+- repository_dispatch
+permissions:
+  checks: write
+  actions: read
+  contents: read
+jobs:
+  run-autograding-tests:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-classroom[bot]'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Test base (bonus)
+      id: test-base-bonus
+      uses: classroom-resources/autograding-command-grader@v1
+      with:
+        test-name: Test base (bonus)
+        setup-command: "./setup.sh"
+        command: "./tests/run.sh base"
+        timeout: 10
+        max-score: 1
+    - name: Test forward
+      id: test-forward
+      uses: classroom-resources/autograding-command-grader@v1
+      with:
+        test-name: Test forward
+        setup-command: "./setup.sh"
+        command: "./tests/run.sh forward"
+        timeout: 10
+        max-score: 3
+    - name: Test stall
+      id: test-stall
+      uses: classroom-resources/autograding-command-grader@v1
+      with:
+        test-name: Test stall
+        setup-command: "./setup.sh"
+        command: "./tests/run.sh stall"
+        timeout: 10
+        max-score: 3
+    - name: Test flush
+      id: test-flush
+      uses: classroom-resources/autograding-command-grader@v1
+      with:
+        test-name: Test flush
+        setup-command: "./setup.sh"
+        command: "./tests/run.sh flush"
+        timeout: 10
+        max-score: 3
+    - name: Autograding Reporter
+      uses: classroom-resources/autograding-grading-reporter@v1
+      env:
+        TEST-BASE-BONUS_RESULTS: "${{steps.test-base-bonus.outputs.result}}"
+        TEST-FORWARD_RESULTS: "${{steps.test-forward.outputs.result}}"
+        TEST-STALL_RESULTS: "${{steps.test-stall.outputs.result}}"
+        TEST-FLUSH_RESULTS: "${{steps.test-flush.outputs.result}}"
+      with:
+        runners: test-base-bonus,test-forward,test-stall,test-flush
