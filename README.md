@@ -1,3 +1,4 @@
+[![Open in Codespaces](https://classroom.github.com/assets/launch-codespace-2972f46106e565e64193e422d61a12cf1da4916b45550586e14ef0a7c637dd04.svg)](https://classroom.github.com/open-in-codespaces?assignment_repo_id=21830821)
 # Implementação de um RISC-V pipeline
 
 O [código fornecido a você](riscvpipeline.sv) nesta simulação é uma implementação pipeline do RISC-V, adaptada do código de Bruno Levy [^1]. Ele roda, por sua vez, os programas adaptados do [nosso livro texto](*.asm) [^2] com um preâmbulo para inicializar os registradores usados nos exemplos do livro. 
