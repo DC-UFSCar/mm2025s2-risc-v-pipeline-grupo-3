@@ -58,15 +58,39 @@ module riscvpipeline (
    wire [31:0] jumpOrBranchAddress;
    wire        jumpOrBranch;
 
+   // Detect load-use hazard early so fetch/decode can stall. If EM stage is
+   // performing a load and the instruction in DE reads the destination
+   // register of that load, then the pipeline must insert a bubble.
+   wire loadUseHazard = isLoad(EM_instr) && (
+      (rs1Id(DE_instr) != 0 && rs1Id(DE_instr) == rdId(EM_instr) && readsRs1(DE_instr)) ||
+      (rs2Id(DE_instr) != 0 && rs2Id(DE_instr) == rdId(EM_instr) && readsRs2(DE_instr))
+   );
+
    always @(posedge clk) begin
-      FD_instr <= Instr;
-      FD_PC    <= F_PC;
-      F_PC     <= F_PC + 4;
-      if (jumpOrBranch)
-    	   F_PC     <= jumpOrBranchAddress;
-      FD_nop <= reset;
-      if (reset)
-    	   F_PC <= 0;
+      // Fetch advances normally, except when a load-use hazard requires a
+      // one-cycle stall. Also when a jump/branch is taken at E we must flush
+      // the instruction fetched after the branch: set FD_nop when reset or
+      // jumpOrBranch so DE will see a NOP.
+      FD_nop <= reset | jumpOrBranch;
+      if (reset) begin
+         FD_instr <= NOP; // initialize to NOP on reset
+         FD_PC    <= 32'b0;
+         F_PC <= 32'b0;
+      end else begin
+         if (!loadUseHazard) begin
+            // If a jump/branch was taken in E this cycle, discard the
+            // instruction already fetched by placing a NOP into FD_instr.
+            if (jumpOrBranch)
+               FD_instr <= NOP;
+            else
+               FD_instr <= Instr;
+            FD_PC    <= F_PC;
+            F_PC     <= F_PC + 4;
+            if (jumpOrBranch)
+               F_PC     <= jumpOrBranchAddress;
+         end
+         // else keep FD and PC unchanged (stall)
+      end
    end
 
 /************************ D: Instruction decode *******************************/
@@ -82,10 +106,34 @@ module riscvpipeline (
 
    reg [31:0] RegisterBank [0:31];
    always @(posedge clk) begin
-      DE_PC    <= FD_PC;
-      DE_instr <= FD_nop ? NOP : FD_instr;
-      DE_rs1 <= rs1Id(FD_instr) ? RegisterBank[rs1Id(FD_instr)] : 32'b0;
-      DE_rs2 <= rs2Id(FD_instr) ? RegisterBank[rs2Id(FD_instr)] : 32'b0;
+      // On reset initialize decode stage to safe values to avoid X
+      // propagation; otherwise freeze DE when we need to stall for load-use.
+      if (reset) begin
+         DE_PC    <= 32'b0;
+         DE_instr <= NOP;
+         DE_rs1 <= 32'b0;
+         DE_rs2 <= 32'b0;
+      end else if (!loadUseHazard) begin
+         DE_PC    <= FD_PC;
+         // If a branch/jump was taken in E this cycle, discard the instruction
+         // coming from FD (the instruction after the branch) so it does not
+         // enter the pipeline.
+         DE_instr <= (FD_nop || jumpOrBranch) ? NOP : FD_instr;
+         // Support read-after-write in same cycle: if writeback will update the
+         // register being read, use the writeBackData immediately (W -> D).
+         DE_rs1 <= rs1Id(FD_instr) ? ((writeBackEn && wbRdId == rs1Id(FD_instr)) ? writeBackData : RegisterBank[rs1Id(FD_instr)]) : 32'b0;
+         DE_rs2 <= rs2Id(FD_instr) ? ((writeBackEn && wbRdId == rs2Id(FD_instr)) ? writeBackData : RegisterBank[rs2Id(FD_instr)]) : 32'b0;
+      end else begin
+         // During the stall we must still reflect writes coming from W stage
+         // into the DE register values (read-after-write). Only update DE_rs*
+         // if the writeback writes to that register in this cycle.
+         if (writeBackEn) begin
+            if (wbRdId == rs1Id(DE_instr))
+               DE_rs1 <= writeBackData;
+            if (wbRdId == rs2Id(DE_instr))
+               DE_rs2 <= writeBackData;
+         end
+      end
       if (writeBackEn)
 	      RegisterBank[wbRdId] <= writeBackData;
    end
@@ -96,8 +144,27 @@ module riscvpipeline (
    reg [31:0] EM_rs2;
    reg [31:0] EM_Eresult;
    reg [31:0] EM_addr;
-   wire [31:0] E_aluIn1 = DE_rs1;
-   wire [31:0] E_aluIn2 = isALUreg(DE_instr) | isBranch(DE_instr) ? DE_rs2 : Iimm(DE_instr);
+   // --- Forwarding: prefer EX/MEM (EM) result when available for ALU ops,
+   // otherwise use MEM/WB (writeBackData). If neither matches, use DE_rs*.
+   wire [4:0] DE_rs1_id = rs1Id(DE_instr);
+   wire [4:0] DE_rs2_id = rs2Id(DE_instr);
+   wire [4:0] EM_rd_id  = rdId(EM_instr);
+   wire [4:0] MW_rd_id  = rdId(MW_instr);
+
+   wire EM_writes = writesRd(EM_instr) && EM_rd_id != 0;
+   wire MW_writes = writesRd(MW_instr) && MW_rd_id != 0;
+
+   wire [31:0] MW_forward_val = writeBackData; // value available at writeback
+
+   wire [31:0] E_aluIn1 = (DE_rs1_id != 0 && EM_writes && EM_rd_id == DE_rs1_id && !isLoad(EM_instr)) ? EM_Eresult :
+                          (DE_rs1_id != 0 && MW_writes && MW_rd_id == DE_rs1_id) ? MW_forward_val :
+                          DE_rs1;
+
+   wire [31:0] E_aluIn2_reg = (DE_rs2_id != 0 && EM_writes && EM_rd_id == DE_rs2_id && !isLoad(EM_instr)) ? EM_Eresult :
+                              (DE_rs2_id != 0 && MW_writes && MW_rd_id == DE_rs2_id) ? MW_forward_val :
+                              DE_rs2;
+
+   wire [31:0] E_aluIn2 = isALUreg(DE_instr) | isBranch(DE_instr) ? E_aluIn2_reg : Iimm(DE_instr);
    wire [4:0]  E_shamt  = isALUreg(DE_instr) ? DE_rs2[4:0] : shamt(DE_instr);
    wire E_minus = DE_instr[30] & isALUreg(DE_instr);
    wire E_arith_shift = DE_instr[30];
@@ -172,12 +239,23 @@ module riscvpipeline (
                                           E_aluOut               ;
 
    always @(posedge clk) begin
-      EM_PC      <= DE_PC;
-      EM_instr   <= DE_instr;
-      EM_rs2     <= DE_rs2;
-      EM_Eresult <= E_result;
-      EM_addr    <= isStore(DE_instr) ? DE_rs1 + Simm(DE_instr) :
-                                        DE_rs1 + Iimm(DE_instr) ;
+      if (reset) begin
+         EM_PC <= 32'b0;
+         EM_instr <= NOP;
+         EM_rs2 <= 32'b0;
+         EM_Eresult <= 32'b0;
+         EM_addr <= 32'b0;
+      end else begin
+         EM_PC      <= DE_PC;
+         // If load-use hazard is detected at DE->EM boundary, inject a NOP
+         // into the E stage (bubble) so the load can reach MW and provide the
+         // value for the dependent instruction.
+         EM_instr   <= loadUseHazard ? NOP : DE_instr;
+         EM_rs2     <= DE_rs2;
+         EM_Eresult <= E_result;
+         EM_addr    <= isStore(DE_instr) ? DE_rs1 + Simm(DE_instr) :
+                                           DE_rs1 + Iimm(DE_instr) ;
+      end
    end
 
 /************************ M: Memory *******************************************/
@@ -200,11 +278,19 @@ module riscvpipeline (
    assign WriteData = EM_rs2;
 
    always @(posedge clk) begin
-      MW_PC        <= EM_PC;
-      MW_instr     <= EM_instr;
-      MW_Eresult   <= EM_Eresult;
-      MW_Mdata     <= ReadData;
-      MW_addr      <= EM_addr;
+      if (reset) begin
+         MW_PC <= 32'b0;
+         MW_instr <= NOP;
+         MW_Eresult <= 32'b0;
+         MW_Mdata <= 32'b0;
+         MW_addr <= 32'b0;
+      end else begin
+         MW_PC        <= EM_PC;
+         MW_instr     <= EM_instr;
+         MW_Eresult   <= EM_Eresult;
+         MW_Mdata     <= ReadData;
+         MW_addr      <= EM_addr;
+      end
    end
 
 /************************ W: WriteBack ****************************************/
